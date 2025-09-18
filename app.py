@@ -1,70 +1,42 @@
-# --- add near your other imports ---
+from fastapi import FastAPI, UploadFile, Form
+from fastapi.responses import StreamingResponse, JSONResponse
 from pptx import Presentation
-from pptx.util import Inches
+import io, json
 
-def safe_fill_quality_table(prs, quality):
-    """Fill a table named 'quality' without deleting rows/columns."""
-    if not quality:
-        return
+app = FastAPI()
 
-    headers = quality.get("headers", [])
-    rows = quality.get("rows", [])
-
+def replace_placeholders(prs, mapping: dict):
     for slide in prs.slides:
         for shape in slide.shapes:
-            # must be a table and named 'quality'
-            if not getattr(shape, "has_table", False):
+            if not getattr(shape, "has_text_frame", False):
                 continue
-            if getattr(shape, "name", "").strip().lower() != "quality":
-                continue
+            text = shape.text_frame.text or ""
+            for k, v in mapping.items():
+                token = "{{" + k + "}}"
+                if token in text:
+                    text = text.replace(token, str(v))
+            shape.text_frame.clear()
+            shape.text_frame.paragraphs[0].text = text
 
-            tbl = shape.table
+@app.get("/health")
+def health():
+    return {"ok": True}
 
-            # --- ensure enough columns (only ADD, never delete) ---
-            need_cols = max(len(headers), max((len(r) for r in rows), default=0))
-            have_cols = len(tbl.columns)
-            if need_cols > have_cols:
-                for _ in range(need_cols - have_cols):
-                    tbl.add_column(Inches(1.5))  # width heuristic
+@app.post("/fill")
+async def fill(template: UploadFile, json_text: str = Form(...)):
+    try:
+        mapping = json.loads(json_text)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
-            # --- ensure enough rows (only ADD, never delete) ---
-            need_rows = 1 + len(rows)  # header + data rows
-            have_rows = len(tbl.rows)
-            if need_rows > have_rows:
-                for _ in range(need_rows - have_rows):
-                    tbl.add_row()
+    prs = Presentation(io.BytesIO(await template.read()))
+    replace_placeholders(prs, mapping)
 
-            # --- write header (row 0) ---
-            for c in range(need_cols):
-                text = headers[c] if c < len(headers) else ""
-                cell = tbl.cell(0, c)
-                tf = cell.text_frame
-                tf.clear()
-                tf.paragraphs[0].text = str(text)
-
-            # clear any extra header cells beyond need_cols
-            for c in range(need_cols, len(tbl.columns)):
-                tf = tbl.cell(0, c).text_frame
-                tf.clear()
-                tf.paragraphs[0].text = ""
-
-            # --- write data rows ---
-            for r_idx, row in enumerate(rows, start=1):
-                for c in range(need_cols):
-                    txt = row[c] if c < len(row) else ""
-                    cell = tbl.cell(r_idx, c)
-                    tf = cell.text_frame
-                    tf.clear()
-                    tf.paragraphs[0].text = str(txt)
-
-            # clear any leftover existing rows (keep structure intact)
-            for r in range(1 + len(rows), len(tbl.rows)):
-                for c in range(len(tbl.columns)):
-                    tf = tbl.cell(r, c).text_frame
-                    tf.clear()
-                    tf.paragraphs[0].text = ""
-
-            return  # stop after first matching table
-
-# --- inside your /fill handler, after prs = Presentation(...) and data = json.loads(...) ---
-safe_fill_quality_table(prs, data.get("quality"))
+    out = io.BytesIO()
+    prs.save(out)
+    out.seek(0)
+    return StreamingResponse(
+        out,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": 'attachment; filename="filled.pptx"'}
+    )
