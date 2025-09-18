@@ -1,32 +1,33 @@
+# app.py
 from fastapi import FastAPI, UploadFile, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from pptx import Presentation
-import io
-import json
+import io, json
 
 app = FastAPI()
 
-def replace_textframe(tf, mapping: dict):
-    for p in tf.paragraphs:
-        for run in p.runs:
-            text = run.text or ""
-            for k, v in mapping.items():
-                token = "{{ " + k + " }}"
-                if token in text:
-                    text = text.replace(token, str(v or ""))
-            run.text = text
+def replace_in_textframe(tf, mapping: dict):
+    """Replace {{tokens}} in an entire text frame (robust vs. split runs)."""
+    text = tf.text or ""
+    for k, v in mapping.items():
+        text = text.replace(f"{{{{{k}}}}}", "" if v is None else str(v))
+    tf.text = text  # setting text rebuilds runs; fine for placeholders
 
 def replace_in_shape(shape, mapping: dict):
-    # Text frames
+    # normal text boxes, titles, placeholders
     if hasattr(shape, "has_text_frame") and shape.has_text_frame:
-        replace_textframe(shape.text_frame, mapping)
+        replace_in_textframe(shape.text_frame, mapping)
 
-    # Tables
-    if shape.has_table:
+    # tables
+    if hasattr(shape, "has_table") and shape.has_table:
         for row in shape.table.rows:
             for cell in row.cells:
-                if cell.text_frame:
-                    replace_textframe(cell.text_frame, mapping)
+                replace_in_textframe(cell.text_frame, mapping)
+
+    # grouped shapes
+    if hasattr(shape, "shape_type") and shape.shape_type == 6:  # MSO_SHAPE_TYPE.GROUP
+        for shp in shape.group_shapes:
+            replace_in_shape(shp, mapping)
 
 @app.get("/health")
 def health():
@@ -36,46 +37,40 @@ def health():
 async def fill(
     template: UploadFile,
     data: UploadFile | None = None,
-    json_text: str = Form(None)
+    json_text: str = Form(default=None),
 ):
     """
-    Accept either:
-    - template: .pptx file (required)
-    - data:     .json file OR
-    - json_text: string field containing JSON
-
-    Returns the filled .pptx with {{ tokens }} replaced.
+    Accepts either:
+      - template: UploadFile (.pptx)
+      - data: UploadFile (.json) OR
+      - json_text: form field containing JSON
+    Returns a filled .pptx.
     """
-    # Get mapping
-    mapping = {}
-    if data is not None:
-        mapping = json.loads((await data.read()).decode("utf-8"))
-    elif json_text:
-        mapping = json.loads(json_text)
+    try:
+        # parse mapping
+        if json_text:
+            mapping = json.loads(json_text)
+        elif data:
+            mapping = json.loads((await data.read()).decode("utf-8"))
+        else:
+            return JSONResponse({"error": "No JSON provided"}, status_code=400)
 
-    # Load PPTX
-    prs_bytes = await template.read()
-    prs = Presentation(io.BytesIO(prs_bytes))
+        # load pptx
+        prs = Presentation(io.BytesIO(await template.read()))
 
-    # Replace tokens across slides
-    for slide in prs.slides:
-        # Slide-level shapes
-        for shape in slide.shapes:
-            replace_in_shape(shape, mapping)
-        # Slide master placeholders (safe pass)
-        if hasattr(slide, "placeholders"):
-            for ph in slide.placeholders:
-                try:
-                    replace_in_shape(ph, mapping)
-                except Exception:
-                    pass
+        # replace across all shapes on all slides
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                replace_in_shape(shape, mapping)
 
-    # Stream back
-    out = io.BytesIO()
-    prs.save(out)
-    out.seek(0)
-    return StreamingResponse(
-        out,
-        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        headers={"Content-Disposition": 'attachment; filename="filled.pptx"'}
-    )
+        # stream result
+        out = io.BytesIO()
+        prs.save(out)
+        out.seek(0)
+        return StreamingResponse(
+            out,
+            media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            headers={"Content-Disposition": 'attachment; filename="filled.pptx"'},
+        )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
