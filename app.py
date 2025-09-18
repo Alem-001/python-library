@@ -1,56 +1,70 @@
-# app.py
-import io, json, math
-from fastapi import FastAPI, UploadFile, Form
-from fastapi.responses import StreamingResponse, PlainTextResponse
+# --- add near your other imports ---
 from pptx import Presentation
-from pptx.util import Pt
-from pptx.enum.text import PP_PARAGRAPH_ALIGNMENT
-from pptx.oxml.xmlchemy import OxmlElement
+from pptx.util import Inches
 
-app = FastAPI()
+def safe_fill_quality_table(prs, quality):
+    """Fill a table named 'quality' without deleting rows/columns."""
+    if not quality:
+        return
 
-# --------- helpers ---------
-def iter_text_shapes(slide):
-    for sh in slide.shapes:
-        if hasattr(sh, "text_frame") and sh.text_frame is not None:
-            yield sh
+    headers = quality.get("headers", [])
+    rows = quality.get("rows", [])
 
-def replace_text_tokens(prs, data):
-    """
-    Replace {{token}} in all text boxes and table cells with strings from data dict (flat only).
-    Nested dicts are ignored here—use table handler for them.
-    """
-    def replace_in_textframe(tf, mapping):
-        if not tf: return
-        # Work per paragraph to preserve formatting reasonably
-        for p in tf.paragraphs:
-            text = "".join(run.text for run in p.runs) if p.runs else p.text
-            changed = False
-            for k, v in mapping.items():
-                token = "{{" + k + "}}"
-                if isinstance(v, (str, int, float)) and token in text:
-                    text = text.replace(token, str(v))
-                    changed = True
-            if changed:
-                # rewrite runs minimally: one run with the new text
-                for _ in range(len(p.runs)):
-                    p.runs[0]._element.getparent().remove(p.runs[0]._element)
-                p.text = text
-
-    # flatten only 1st-level scalars
-    flat = {k: v for k, v in data.items() if isinstance(v, (str, int, float))}
     for slide in prs.slides:
-        for sh in iter_text_shapes(slide):
-            replace_in_textframe(sh.text_frame, flat)
+        for shape in slide.shapes:
+            # must be a table and named 'quality'
+            if not getattr(shape, "has_table", False):
+                continue
+            if getattr(shape, "name", "").strip().lower() != "quality":
+                continue
 
-        # also replace inside tables
-        for sh in slide.shapes:
-            if sh.has_table:
-                tbl = sh.table
-                for r in tbl.rows:
-                    for c in r.cells:
-                        replace_in_textframe(c.text_frame, flat)
+            tbl = shape.table
 
-def _add_table_at_placeholder(slide, ph_shape, headers, rows):
-    # Create a table that exactly fits the placeholder box, then delete the box
-    cols = len(headers) if headers else len(rows[0])
+            # --- ensure enough columns (only ADD, never delete) ---
+            need_cols = max(len(headers), max((len(r) for r in rows), default=0))
+            have_cols = len(tbl.columns)
+            if need_cols > have_cols:
+                for _ in range(need_cols - have_cols):
+                    tbl.add_column(Inches(1.5))  # width heuristic
+
+            # --- ensure enough rows (only ADD, never delete) ---
+            need_rows = 1 + len(rows)  # header + data rows
+            have_rows = len(tbl.rows)
+            if need_rows > have_rows:
+                for _ in range(need_rows - have_rows):
+                    tbl.add_row()
+
+            # --- write header (row 0) ---
+            for c in range(need_cols):
+                text = headers[c] if c < len(headers) else ""
+                cell = tbl.cell(0, c)
+                tf = cell.text_frame
+                tf.clear()
+                tf.paragraphs[0].text = str(text)
+
+            # clear any extra header cells beyond need_cols
+            for c in range(need_cols, len(tbl.columns)):
+                tf = tbl.cell(0, c).text_frame
+                tf.clear()
+                tf.paragraphs[0].text = ""
+
+            # --- write data rows ---
+            for r_idx, row in enumerate(rows, start=1):
+                for c in range(need_cols):
+                    txt = row[c] if c < len(row) else ""
+                    cell = tbl.cell(r_idx, c)
+                    tf = cell.text_frame
+                    tf.clear()
+                    tf.paragraphs[0].text = str(txt)
+
+            # clear any leftover existing rows (keep structure intact)
+            for r in range(1 + len(rows), len(tbl.rows)):
+                for c in range(len(tbl.columns)):
+                    tf = tbl.cell(r, c).text_frame
+                    tf.clear()
+                    tf.paragraphs[0].text = ""
+
+            return  # stop after first matching table
+
+# --- inside your /fill handler, after prs = Presentation(...) and data = json.loads(...) ---
+safe_fill_quality_table(prs, data.get("quality"))
