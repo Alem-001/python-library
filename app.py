@@ -34,43 +34,78 @@ def _replace_in_table_cells(table, mapping: dict):
                     cell.text = new_text
 
 def _remove_shape(slide, shape):
-    """Delete a shape from a slide."""
     sp = shape._element
     sp.getparent().remove(sp)
 
-def _rebuild_table_from_json(slide, placeholder_shape, financials: dict):
+def _normalize_table_font(table, size_pt=12):
+    for row in table.rows:
+        for cell in row.cells:
+            if cell.text_frame:
+                for p in cell.text_frame.paragraphs:
+                    for run in p.runs:
+                        run.font.size = Pt(size_pt)
+
+# ---------- NEW: generic quality table (any headers, all stringy values)
+def _rebuild_simple_table(slide, placeholder_shape, table_spec: dict):
     """
-    Build a new table where the placeholder text is {{TABLE:financials}}.
-    JSON format:
+    Build a generic table for quality data.
+    Expected JSON:
     {
-      "years": ["2022","2023","2024"],
+      "headers": ["Label", "Value"],      # optional; default = ["Label", "Value"]
       "rows": [
-        {"item":"Revenue","values":["3.85m","4.27m","6.53m"]},
-        {"item":"EBITDA","values":["15.9%","18.1%","25.1%"]}
+        ["Business at a glance", "Flat-roof specialist"],
+        ["HQ", "Bad Kreuznach, DE"],
+        ["Employees", "19 + 2 MDs"],
+        ["Reason to sell", "Succession (age)"]
       ]
     }
+    Notes:
+    - All values are treated as strings (even if they look like numbers).
+    - Number of columns = len(headers).
+    - Each row must have same length as headers.
     """
-    years = financials.get("years", [])
-    rows = financials.get("rows", [])
+    headers = table_spec.get("headers") or ["Label", "Value"]
+    rows = table_spec.get("rows") or []
 
-    n_rows = 1 + len(rows)       # header + data
-    n_cols = 1 + len(years)      # item + values
+    n_rows = 1 + len(rows)
+    n_cols = len(headers)
 
-    # Position from placeholder
     left, top, width, height = placeholder_shape.left, placeholder_shape.top, placeholder_shape.width, placeholder_shape.height
     _remove_shape(slide, placeholder_shape)
 
-    # Add new table
     table_shape = slide.shapes.add_table(n_rows, n_cols, left, top, width, height)
     table = table_shape.table
 
-    # Header row
+    # Header
+    for c, h in enumerate(headers):
+        table.cell(0, c).text = str(h)
+
+    # Data
+    for r, rowvals in enumerate(rows, start=1):
+        for c, val in enumerate(rowvals[:n_cols]):
+            table.cell(r, c).text = str(val)
+
+    _normalize_table_font(table, 12)
+
+# ---------- Financial table (kept here for later use if needed)
+def _rebuild_table_from_json(slide, placeholder_shape, financials: dict):
+    years = financials.get("years", [])
+    rows = financials.get("rows", [])
+
+    n_rows = 1 + len(rows)
+    n_cols = 1 + len(years)
+
+    left, top, width, height = placeholder_shape.left, placeholder_shape.top, placeholder_shape.width, placeholder_shape.height
+    _remove_shape(slide, placeholder_shape)
+
+    table_shape = slide.shapes.add_table(n_rows, n_cols, left, top, width, height)
+    table = table_shape.table
+
     table.cell(0, 0).text = "Item"
     for c, y in enumerate(years, start=1):
         if c < len(table.columns):
             table.cell(0, c).text = str(y)
 
-    # Data rows
     for r, rowdata in enumerate(rows, start=1):
         table.cell(r, 0).text = str(rowdata.get("item", ""))
         vals = rowdata.get("values", [])
@@ -78,20 +113,22 @@ def _rebuild_table_from_json(slide, placeholder_shape, financials: dict):
             if c < len(table.columns):
                 table.cell(r, c).text = str(val)
 
-    # normalize font size
-    for row in table.rows:
-        for cell in row.cells:
-            for p in cell.text_frame.paragraphs:
-                for run in p.runs:
-                    run.font.size = Pt(12)
+    _normalize_table_font(table, 12)
 
-def _walk_shapes(slide, mapping: dict):
-    for shp in slide.shapes:
-        # Rebuild table from marker like {{TABLE:financials}}
+def _walk_shapes(container, mapping: dict):
+    # container can be slide or a group shape
+    for shp in container.shapes:
+        # Build table from marker like {{TABLE:quality}} or {{TABLE:financials}}
         if getattr(shp, "has_text_frame", False) and shp.text and "{{TABLE:" in shp.text:
             key = shp.text.strip().replace("{{TABLE:", "").replace("}}", "").strip()
             if key in mapping and isinstance(mapping[key], dict):
-                _rebuild_table_from_json(slide, shp, mapping[key])
+                spec = mapping[key]
+                # If caller passed "headers"/"rows" => simple quality table
+                if "rows" in spec and isinstance(spec["rows"], list):
+                    _rebuild_simple_table(container, shp, spec)
+                # If caller passed "years"/"rows" => financial table
+                elif "years" in spec and "rows" in spec:
+                    _rebuild_table_from_json(container, shp, spec)
             continue
 
         # Normal text boxes
@@ -121,7 +158,6 @@ async def fill(
     json_text: str = Form(None),
 ):
     try:
-        # load mapping
         if data:
             mapping = json.loads((await data.read()).decode("utf-8"))
         elif json_text:
@@ -129,14 +165,11 @@ async def fill(
         else:
             return JSONResponse({"error": "No JSON provided"}, status_code=400)
 
-        # load pptx
         prs = Presentation(io.BytesIO(await template.read()))
 
-        # walk all slides/shapes
         for slide in prs.slides:
             _walk_shapes(slide, mapping)
 
-        # output pptx
         out = io.BytesIO()
         prs.save(out)
         out.seek(0)
